@@ -3,18 +3,28 @@ import { NextResponse } from "next/server";
 import { createSupabaseAdmin } from "../../../lib/supabase-admin";
 
 export async function GET() {
-  // Temporary diagnostic endpoint.
-  // No database query and no secrets are returned.
   try {
-    createSupabaseAdmin();
+    const supabase = createSupabaseAdmin();
+
+    const { error } = await supabase
+      .from("trial_usage")
+      .select("user_id")
+      .limit(1);
+
+    if (error) {
+      return NextResponse.json(
+        { status: "connection_failed" },
+        { status: 503 }
+      );
+    }
 
     return NextResponse.json({
-      status: "configured",
-      note: "Supabase client initialized; connection not tested",
+      status: "connected",
+      database: "supabase",
     });
   } catch {
     return NextResponse.json(
-      { status: "configuration_error" },
+      { status: "server_error" },
       { status: 500 }
     );
   }
