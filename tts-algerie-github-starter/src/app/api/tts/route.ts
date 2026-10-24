@@ -1,109 +1,25 @@
 
-import { NextRequest, NextResponse } from "next/server";
-import { verifySupabaseUser } from "../../../lib/supabase-auth";
+    const admin = createSupabaseAdmin();
 
-const MAX_TEXT_LENGTH = 2000;
-const MAX_BODY_BYTES = 8192;
+    const { data: allowed, error: rateError } =
+      await admin.rpc("check_tts_rate_limit", {
+        p_user_id: user.id,
+      });
 
-export async function POST(request: NextRequest) {
-  try {
-    const contentLength = request.headers.get("content-length");
-
-    if (
-      contentLength !== null &&
-      (!/^\d+$/.test(contentLength) ||
-        Number(contentLength) > MAX_BODY_BYTES)
-    ) {
+    if (rateError) {
       return NextResponse.json(
-        { error: "REQUEST_TOO_LARGE" },
-        { status: 413 }
+        { error: "RATE_LIMIT_CHECK_FAILED" },
+        { status: 503 }
       );
     }
 
-    const user = await verifySupabaseUser(
-      request.headers.get("authorization")
-    );
-
-    if (!user) {
+    if (allowed !== true) {
       return NextResponse.json(
-        { error: "UNAUTHORIZED" },
-        { status: 401 }
-      );
-    }
-
-    const reader = request.body?.getReader();
-
-    if (!reader) {
-      return NextResponse.json(
-        { error: "INVALID_BODY" },
-        { status: 400 }
-      );
-    }
-
-    const chunks: Uint8Array[] = [];
-    let totalBytes = 0;
-
-    try {
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-
-        totalBytes += value.byteLength;
-
-        if (totalBytes > MAX_BODY_BYTES) {
-          await reader.cancel();
-          return NextResponse.json(
-            { error: "REQUEST_TOO_LARGE" },
-            { status: 413 }
-          );
-        }
-
-        chunks.push(value);
-      }
-    } finally {
-      reader.releaseLock();
-    }
-
-    const bytes = new Uint8Array(totalBytes);
-    let offset = 0;
-
-    for (const chunk of chunks) {
-      bytes.set(chunk, offset);
-      offset += chunk.byteLength;
-    }
-
-    let body: unknown;
-
-    try {
-      body = JSON.parse(
-        new TextDecoder("utf-8", { fatal: true }).decode(bytes)
-      );
-    } catch {
-      return NextResponse.json(
-        { error: "INVALID_JSON" },
-        { status: 400 }
-      );
-    }
-
-    if (
-      typeof body !== "object" ||
-      body === null ||
-      Array.isArray(body) ||
-      !("text" in body) ||
-      typeof body.text !== "string"
-    ) {
-      return NextResponse.json(
-        { error: "INVALID_TEXT" },
-        { status: 400 }
-      );
-    }
-
-    const text = body.text.trim();
-
-    if (!text || text.length > MAX_TEXT_LENGTH) {
-      return NextResponse.json(
-        { error: "INVALID_TEXT" },
-        { status: 400 }
+        {
+          error: "RATE_LIMIT_EXCEEDED",
+          message: "Maximum 10 requêtes par minute.",
+        },
+        { status: 429 }
       );
     }
 
@@ -114,10 +30,4 @@ export async function POST(request: NextRequest) {
       },
       { status: 503 }
     );
-  } catch {
-    return NextResponse.json(
-      { error: "SERVER_ERROR" },
-      { status: 500 }
-    );
-  }
-}
+
