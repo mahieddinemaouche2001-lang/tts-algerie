@@ -35,7 +35,8 @@ const messages = {
     voice: "الصوت",
     speed: "السرعة",
     generate: "توليد الصوت",
-    waiting: "خدمة توليد الصوت قيد الإعداد.",
+    generating: "جارٍ التحقق...",
+    waiting: "خدمة توليد الصوت قيد الإعداد. لم يتم استهلاك أي محاولة مجانية.",
     history: "السجل",
     soon: "قريباً",
     guest: "بدء جلسة ضيف",
@@ -45,6 +46,11 @@ const messages = {
     success: "تم إنشاء جلسة الضيف بنجاح.",
     error: "فشل الاتصال. حاول مجدداً.",
     config: "إعداد hCaptcha غير مكتمل.",
+    login: "يجب إنشاء جلسة ضيف أولاً.",
+    limit: "لقد استنفدت المحاولتين المجانيتين أو توجد محاولات محجوزة.",
+    rate: "طلبات كثيرة. يرجى الانتظار دقيقة ثم المحاولة مجدداً.",
+    invalid: "الرجاء إدخال نص صحيح لا يتجاوز 2000 حرف.",
+    apiError: "تعذّر التحقق من الطلب. حاول مجدداً.",
     note: "نسخة اختبارية. Gemini TTS غير مفعّل بعد.",
   },
   fr: {
@@ -55,7 +61,8 @@ const messages = {
     voice: "Voix",
     speed: "Vitesse",
     generate: "Générer la voix",
-    waiting: "Le moteur TTS est en préparation.",
+    generating: "Vérification...",
+    waiting: "Le moteur TTS est en préparation. Aucun essai gratuit consommé.",
     history: "Historique",
     soon: "Bientôt disponible",
     guest: "Démarrer une session invitée",
@@ -65,42 +72,61 @@ const messages = {
     success: "Session invitée créée avec succès.",
     error: "Connexion impossible. Réessayez.",
     config: "Configuration hCaptcha incomplète.",
+    login: "Veuillez démarrer une session invitée.",
+    limit: "Vos deux essais gratuits sont épuisés ou des essais sont réservés.",
+    rate: "Trop de requêtes. Réessayez dans une minute.",
+    invalid: "Saisissez un texte valide de 2000 caractères maximum.",
+    apiError: "Impossible de vérifier la demande. Réessayez.",
     note: "Version de test. Gemini TTS est désactivé.",
   },
+};
+
+type ApiResponse = {
+  error?: string;
+  trial_consumed?: boolean;
 };
 
 export default function Home() {
   const [lang, setLang] = useState<"ar" | "fr">("ar");
   const [value, setValue] = useState("");
   const [speed, setSpeed] = useState("normal");
+
   const [captchaToken, setCaptchaToken] = useState("");
   const [signedIn, setSignedIn] = useState(false);
-  const [loading, setLoading] = useState(false);
+  const [authLoading, setAuthLoading] = useState(false);
+  const [ttsLoading, setTtsLoading] = useState(false);
   const [status, setStatus] = useState("");
-  const [showStatus, setShowStatus] = useState(false);
+  const [ttsStatus, setTtsStatus] = useState("");
 
   const captchaContainer = useRef<HTMLDivElement>(null);
   const widgetId = useRef<number | null>(null);
-
   const t = messages[lang];
 
+  // Vérifier la session Supabase existante.
   useEffect(() => {
     const supabase = createPublicSupabaseClient();
+    let active = true;
 
     void supabase.auth.getSession().then(({ data }) => {
-      setSignedIn(Boolean(data.session));
+      if (active) {
+        setSignedIn(Boolean(data.session));
+      }
     });
 
     const { data: listener } =
       supabase.auth.onAuthStateChange((_event, session) => {
-        setSignedIn(Boolean(session));
+        if (active) {
+          setSignedIn(Boolean(session));
+        }
       });
 
     return () => {
+      active = false;
       listener.subscription.unsubscribe();
     };
   }, []);
 
+  // Charger hCaptcha.
   useEffect(() => {
     if (!SITE_KEY) return;
 
@@ -153,14 +179,16 @@ export default function Home() {
 
     return () => {
       active = false;
+
       if (window.voixCaptchaReady === renderCaptcha) {
         delete window.voixCaptchaReady;
       }
     };
   }, []);
 
+  // Créer une session invitée avec hCaptcha.
   const startGuestSession = async () => {
-    if (signedIn || loading) return;
+    if (signedIn || authLoading) return;
 
     if (!SITE_KEY) {
       setStatus(t.config);
@@ -172,7 +200,7 @@ export default function Home() {
       return;
     }
 
-    setLoading(true);
+    setAuthLoading(true);
     setStatus("");
 
     try {
@@ -194,7 +222,7 @@ export default function Home() {
     } catch {
       setStatus(t.error);
     } finally {
-      setLoading(false);
+      setAuthLoading(false);
       setCaptchaToken("");
 
       if (widgetId.current !== null) {
@@ -203,10 +231,98 @@ export default function Home() {
     }
   };
 
+  // Envoyer une requête authentifiée à notre API.
+  const generateVoice = async () => {
+    if (ttsLoading) return;
+
+    const text = value.trim();
+
+    if (!text || text.length > 2000) {
+      setTtsStatus(t.invalid);
+      return;
+    }
+
+    setTtsLoading(true);
+    setTtsStatus("");
+
+    try {
+      const supabase = createPublicSupabaseClient();
+
+      const { data, error: sessionError } =
+        await supabase.auth.getSession();
+
+      if (sessionError || !data.session) {
+        setSignedIn(false);
+        setTtsStatus(t.login);
+        return;
+      }
+
+      const response = await fetch("/api/tts", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${data.session.access_token}`,
+        },
+        body: JSON.stringify({ text }),
+        cache: "no-store",
+      });
+
+      const result: ApiResponse = await response
+        .json()
+        .catch(() => ({ error: "INVALID_RESPONSE" }));
+
+      if (
+        response.status === 503 &&
+        result.error === "TTS_NOT_READY"
+      ) {
+        setTtsStatus(t.waiting);
+        return;
+      }
+
+      if (
+        response.status === 429 ||
+        result.error === "RATE_LIMIT_EXCEEDED"
+      ) {
+        setTtsStatus(t.rate);
+        return;
+      }
+
+      if (
+        response.status === 403 &&
+        result.error === "FREE_TRIAL_LIMIT_REACHED"
+      ) {
+        setTtsStatus(t.limit);
+        return;
+      }
+
+      if (response.status === 401) {
+        setTtsStatus(t.login);
+        return;
+      }
+
+      if (
+        response.status === 400 ||
+        response.status === 413
+      ) {
+        setTtsStatus(t.invalid);
+        return;
+      }
+
+      // Aucun fichier audio n'est encore attendu.
+      // Gemini sera intégré dans une étape ultérieure.
+      setTtsStatus(t.apiError);
+    } catch {
+      setTtsStatus(t.apiError);
+    } finally {
+      setTtsLoading(false);
+    }
+  };
+
   return (
     <main dir={lang === "ar" ? "rtl" : "ltr"}>
       <header>
         <strong>VOIX DZ</strong>
+
         <nav>
           <button
             onClick={() =>
@@ -215,6 +331,7 @@ export default function Home() {
           >
             {lang === "ar" ? "Français" : "العربية"}
           </button>
+
           <span>
             {signedIn ? t.connected : t.guest}
           </span>
@@ -225,6 +342,7 @@ export default function Home() {
         <p className="eyebrow">
           TEXT TO SPEECH · ALGERIA
         </p>
+
         <h1>{t.title}</h1>
         <p>{t.subtitle}</p>
       </section>
@@ -247,13 +365,13 @@ export default function Home() {
             <button
               className="primary"
               disabled={
-                loading ||
+                authLoading ||
                 !captchaToken ||
                 !SITE_KEY
               }
               onClick={startGuestSession}
             >
-              {loading ? t.connecting : t.guest}
+              {authLoading ? t.connecting : t.guest}
             </button>
           </div>
         )}
@@ -290,6 +408,7 @@ export default function Home() {
         <div className="fields">
           <div>
             <label htmlFor="voice">{t.voice}</label>
+
             <select id="voice" disabled>
               <option>Standard (à valider)</option>
             </select>
@@ -297,6 +416,7 @@ export default function Home() {
 
           <div>
             <label htmlFor="speed">{t.speed}</label>
+
             <select
               id="speed"
               value={speed}
@@ -311,15 +431,15 @@ export default function Home() {
 
         <button
           className="primary"
-          disabled={!value.trim()}
-          onClick={() => setShowStatus(true)}
+          disabled={!value.trim() || ttsLoading}
+          onClick={generateVoice}
         >
-          {t.generate}
+          {ttsLoading ? t.generating : t.generate}
         </button>
 
-        {showStatus && (
+        {ttsStatus && (
           <p role="status" className="status">
-            {t.waiting}
+            {ttsStatus}
           </p>
         )}
       </section>
