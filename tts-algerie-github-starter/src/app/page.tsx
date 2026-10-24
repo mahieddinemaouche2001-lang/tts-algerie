@@ -84,6 +84,8 @@ const messages = {
 type ApiResponse = {
   error?: string;
   trial_consumed?: boolean;
+  audioBase64?: string;
+  mimeType?: string;
 };
 
 export default function Home() {
@@ -97,6 +99,7 @@ export default function Home() {
   const [ttsLoading, setTtsLoading] = useState(false);
   const [status, setStatus] = useState("");
   const [ttsStatus, setTtsStatus] = useState("");
+  const [audioUrl, setAudioUrl] = useState<string | null>(null);
 
   const captchaContainer = useRef<HTMLDivElement>(null);
   const widgetId = useRef<number | null>(null);
@@ -244,6 +247,7 @@ export default function Home() {
 
     setTtsLoading(true);
     setTtsStatus("");
+    setAudioUrl(null);
 
     try {
       const supabase = createPublicSupabaseClient();
@@ -308,8 +312,19 @@ export default function Home() {
         return;
       }
 
-      // Aucun fichier audio n'est encore attendu.
-      // Gemini sera intégré dans une étape ultérieure.
+      if (response.ok && typeof result.audioBase64 === "string" && result.mimeType === "audio/wav") {
+        const binary = atob(result.audioBase64);
+        const bytes = new Uint8Array(binary.length);
+        for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+        const url = URL.createObjectURL(new Blob([bytes], { type: "audio/wav" }));
+        setAudioUrl(url);
+        setTtsStatus(lang === "ar" ? "تم إنشاء الصوت بنجاح. استُهلكت محاولة واحدة." : "Audio généré. Un essai gratuit consommé.");
+        return;
+      }
+      if (result.error === "GLOBAL_DAILY_LIMIT") {
+        setTtsStatus(lang === "ar" ? "تم بلوغ الحد اليومي للتجارب." : "Plafond global quotidien atteint.");
+        return;
+      }
       setTtsStatus(t.apiError);
     } catch {
       setTtsStatus(t.apiError);
@@ -436,6 +451,13 @@ export default function Home() {
         >
           {ttsLoading ? t.generating : t.generate}
         </button>
+
+        {audioUrl && (
+          <div style={{ display: "grid", gap: 10, marginTop: 16 }}>
+            <audio controls src={audioUrl} style={{ width: "100%" }} />
+            <a href={audioUrl} download="voix-dz.wav">{lang === "ar" ? "تحميل الصوت WAV" : "Télécharger le WAV"}</a>
+          </div>
+        )}
 
         {ttsStatus && (
           <p role="status" className="status">
