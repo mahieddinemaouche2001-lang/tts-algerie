@@ -1,7 +1,9 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { createPublicSupabaseClient } from "../../lib/supabase";
+import { AdminShell, saveAdminToken } from "@/components/admin-shell";
+import { useLocale } from "@/components/locale-provider";
+import { getBrowserClient } from "@/lib/supabase-browser";
 
 type Stats = {
   profiles: number;
@@ -11,112 +13,288 @@ type Stats = {
   geminiEnabled: boolean;
 };
 
+const TOKEN_KEY = "vdz_admin_token";
+
 export default function AdminPage() {
+  const { t } = useLocale();
+  const [phase, setPhase] = useState<"checking" | "login" | "ready">("checking");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [captchaToken, setCaptchaToken] = useState("");
   const [loading, setLoading] = useState(false);
-  const [connected, setConnected] = useState(false);
-  const [stats, setStats] = useState<Stats | null>(null);
   const [message, setMessage] = useState("");
+  const [stats, setStats] = useState<Stats | null>(null);
+  const [token, setToken] = useState<string | null>(null);
+
   const siteKey = process.env.NEXT_PUBLIC_HCAPTCHA_SITE_KEY;
 
-  useEffect(() => {
-    const supabase = createPublicSupabaseClient();
-    void supabase.auth.getSession().then(({ data }) => {
-      setConnected(Boolean(data.session));
-      if (data.session) void loadStats(data.session.access_token);
-    });
-    const { data } = supabase.auth.onAuthStateChange((_event, session) => {
-      setConnected(Boolean(session));
-      if (!session) setStats(null);
-    });
-    return () => data.subscription.unsubscribe();
-  }, []);
-
-  useEffect(() => {
-    if (!siteKey || connected) return;
-    // hCaptcha invisible mode: on a protected Preview, a manual login may require CAPTCHA.
-    // This form leaves the token empty if no verification widget is configured.
-    let widget: number | null = null;
-    const render = () => {
-      const host = document.getElementById("admin-captcha");
-      const captcha = (window as unknown as { hcaptcha?: { render: (host: HTMLElement, settings: Record<string, unknown>) => number; remove: (id: number) => void } }).hcaptcha;
-      if (host && captcha && widget === null) widget = captcha.render(host, { sitekey: siteKey, callback: (token: string) => setCaptchaToken(token), "expired-callback": () => setCaptchaToken("") });
-    };
-    const scriptId = "admin-hcaptcha-script";
-    if ((window as unknown as { hcaptcha?: unknown }).hcaptcha) render();
-    else {
-      const previous = document.getElementById(scriptId) as HTMLScriptElement | null;
-      if (previous) previous.addEventListener("load", render);
-      else {
-        const script = document.createElement("script");
-        script.id = scriptId;
-        script.src = "https://js.hcaptcha.com/1/api.js?render=explicit";
-        script.async = true;
-        script.addEventListener("load", render);
-        document.head.appendChild(script);
-      }
-    }
-    return () => { if (widget !== null) { const api = (window as unknown as { hcaptcha?: { remove: (id: number) => void } }).hcaptcha; api?.remove(widget); } };
-  }, [connected, siteKey]);
-
-  async function loadStats(token: string) {
+  async function loadStats(accessToken: string) {
     setLoading(true);
     try {
-      const response = await fetch("/api/admin/stats", { headers: { Authorization: `Bearer ${token}` }, cache: "no-store" });
+      const response = await fetch("/api/admin/stats", {
+        headers: { Authorization: `Bearer ${accessToken}` },
+        cache: "no-store",
+      });
       if (response.ok) {
         setStats((await response.json()) as Stats);
         setMessage("");
+        setPhase("ready");
+      } else if (response.status === 403) {
+        setMessage(t("Ce compte n'est pas administrateur.", "هذا الحساب ليس مسؤولاً."));
+        sessionStorage.removeItem(TOKEN_KEY);
+        setPhase("login");
+      } else if (response.status === 401) {
+        sessionStorage.removeItem(TOKEN_KEY);
+        setPhase("login");
+      } else if (response.status === 503) {
+        setMessage(
+          t(
+            "Configuration admin incomplète (ADMIN_USER_ID ou base de données).",
+            "إعداد الإدارة غير مكتمل (ADMIN_USER_ID أو قاعدة البيانات)."
+          )
+        );
+        setPhase("login");
       } else {
-        setStats(null);
-        setMessage(response.status === 403 ? "Accès refusé : ce compte n'est pas administrateur." : response.status === 503 ? "Configuration Admin ou statistiques indisponibles." : "Accès non autorisé.");
+        setMessage(t("Accès refusé.", "تم رفض الوصول."));
+        setPhase("login");
       }
-    } catch { setMessage("Connexion au serveur impossible."); }
-    finally { setLoading(false); }
+    } catch {
+      setMessage(t("Connexion au serveur impossible.", "تعذّر الاتصال بالخادم."));
+      setPhase("login");
+    } finally {
+      setLoading(false);
+    }
   }
+
+  useEffect(() => {
+    const stored = sessionStorage.getItem(TOKEN_KEY);
+    if (stored) {
+      setToken(stored);
+      void loadStats(stored);
+      return;
+    }
+
+    const supabase = getBrowserClient();
+    if (!supabase) {
+      setPhase("login");
+      return;
+    }
+
+    void supabase.auth.getSession().then(({ data }) => {
+      if (data.session?.access_token) {
+        void loadStats(data.session.access_token);
+      } else {
+        setPhase("login");
+      }
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // hCaptcha, only while the login form is visible.
+  useEffect(() => {
+    if (phase !== "login" || !siteKey) return;
+
+    let widget: number | null = null;
+
+    const render = () => {
+      const host = document.getElementById("admin-captcha");
+      const captcha = (
+        window as unknown as {
+          hcaptcha?: {
+            render: (el: HTMLElement, options: Record<string, unknown>) => number;
+            remove: (id: number) => void;
+          };
+        }
+      ).hcaptcha;
+      if (host && captcha && widget === null) {
+        widget = captcha.render(host, {
+          sitekey: siteKey,
+          callback: (value: string) => setCaptchaToken(value),
+          "expired-callback": () => setCaptchaToken(""),
+        });
+      }
+    };
+
+    const existing = document.getElementById("admin-hcaptcha-script");
+    if ((window as unknown as { hcaptcha?: unknown }).hcaptcha) {
+      render();
+    } else if (existing) {
+      existing.addEventListener("load", render);
+    } else {
+      const script = document.createElement("script");
+      script.id = "admin-hcaptcha-script";
+      script.src = "https://js.hcaptcha.com/1/api.js?render=explicit";
+      script.async = true;
+      script.addEventListener("load", render);
+      document.head.appendChild(script);
+    }
+
+    return () => {
+      if (widget !== null) {
+        (
+          window as unknown as { hcaptcha?: { remove: (id: number) => void } }
+        ).hcaptcha?.remove(widget);
+      }
+    };
+  }, [phase, siteKey]);
 
   async function login(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    setLoading(true); setMessage("");
-    try {
-      const supabase = createPublicSupabaseClient();
-      const { data, error } = await supabase.auth.signInWithPassword({ email, password, options: captchaToken ? { captchaToken } : undefined });
-      if (error || !data.session) { setMessage(error?.message ?? "Échec de connexion."); return; }
-      setConnected(true);
-      await loadStats(data.session.access_token);
-    } catch { setMessage("Connexion impossible."); }
-    finally { setLoading(false); }
+    if (loading) return;
+
+    const supabase = getBrowserClient();
+    if (!supabase) {
+      setMessage(t("Supabase n'est pas configuré.", "Supabase غير مهيأ."));
+      return;
+    }
+
+    setLoading(true);
+    setMessage("");
+
+    const { data, error } = await supabase.auth.signInWithPassword({
+      email: email.trim(),
+      password,
+      options: captchaToken ? { captchaToken } : undefined,
+    });
+
+    if (error || !data.session) {
+      setMessage(
+        t(
+          "Connexion refusée. Vérifiez l'e-mail, le mot de passe et le CAPTCHA.",
+          "تم رفض تسجيل الدخول. تحقق من البريد وكلمة المرور و CAPTCHA."
+        )
+      );
+      setLoading(false);
+      return;
+    }
+
+    saveAdminToken(data.session.access_token);
+    setToken(data.session.access_token);
+    await loadStats(data.session.access_token);
   }
 
-  async function logout() {
-    await createPublicSupabaseClient().auth.signOut();
-    setStats(null); setConnected(false); setMessage("");
+  if (phase === "ready") {
+    return (
+      <AdminShell
+        title={t("Vue d'ensemble", "نظرة عامة")}
+        subtitle={t(
+          "Chiffres lus en base, aucune donnée simulée.",
+          "أرقام مقروءة من قاعدة البيانات، دون بيانات محاكاة."
+        )}
+      >
+        {loading ? <p className="vz-muted">{t("Chargement…", "جارٍ التحميل…")}</p> : null}
+
+        {stats ? (
+          <>
+            <div className="vz-grid vz-grid--3" style={{ marginBottom: 20 }}>
+              <div className="vz-kpi">
+                <strong>{stats.profiles}</strong>
+                <span>{t("Profils", "الملفات")}</span>
+              </div>
+              <div className="vz-kpi">
+                <strong>{stats.generations}</strong>
+                <span>{t("Générations", "عمليات التوليد")}</span>
+              </div>
+              <div className="vz-kpi">
+                <strong>{stats.trialsUsed}</strong>
+                <span>{t("Essais consommés", "المحاولات المستهلكة")}</span>
+              </div>
+              <div className="vz-kpi">
+                <strong>{stats.activeReservations}</strong>
+                <span>{t("Réservations actives", "الحجوزات النشطة")}</span>
+              </div>
+              <div className="vz-kpi">
+                <strong style={{ fontSize: 18 }}>
+                  {stats.geminiEnabled ? t("Actif", "مفعّل") : t("Désactivé", "معطّل")}
+                </strong>
+                <span>{t("Moteur Gemini TTS", "محرك Gemini TTS")}</span>
+              </div>
+            </div>
+
+            <div className="vz-alert vz-alert--info">
+              {t(
+                "Aucune clé secrète n'est affichée dans cette interface. Les valeurs d'environnement ne sortent jamais du serveur.",
+                "لا يُعرض أي مفتاح سري في هذه الواجهة. قيم البيئة لا تغادر الخادم أبداً."
+              )}
+            </div>
+          </>
+        ) : null}
+
+        {message ? (
+          <p className="vz-alert" role="alert" style={{ marginTop: 16 }}>
+            {message}
+          </p>
+        ) : null}
+      </AdminShell>
+    );
   }
 
-  const inputStyle: React.CSSProperties = { width: "100%", padding: "12px", border: "1px solid #a0a0a0", borderRadius: 8, background: "white", color: "#111" };
-  const buttonStyle: React.CSSProperties = { padding: "12px 20px", background: "#1b5df5", borderRadius: 8, color: "white", cursor: "pointer", border: "none" };
+  return (
+    <div className="vz-shell">
+      <div className="vz-auth">
+        <div className="vz-auth__card">
+          <span className="vz-badge">{t("Administration", "الإدارة")}</span>
+          <h1 className="vz-h2" style={{ fontSize: 26, marginTop: 12 }}>
+            {t("Connexion administrateur", "دخول المسؤول")}
+          </h1>
+          <p className="vz-muted" style={{ marginTop: 6, marginBottom: 20 }}>
+            {t(
+              "Accès réservé. La vérification du rôle est faite par le serveur.",
+              "وصول محصور. يتحقق الخادم من الدور."
+            )}
+          </p>
 
-  return <main dir="ltr" style={{ maxWidth: 960, margin: "40px auto", padding: 20, fontFamily: "Arial, sans-serif", color: "#1d2939" }}>
-    <header style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
-      <h1 style={{ margin: 0 }}>VOIX DZ — Administration</h1>
-      <a href="/">Retour au site</a>
-    </header>
-    <p>Accès réservé aux administrateurs autorisés. Les vérifications sont effectuées par le serveur.</p>
-    {!connected && <form onSubmit={login} style={{ display: "grid", gap: 14, maxWidth: 420, marginTop: 24 }}>
-      <label>Adresse e-mail<input style={inputStyle} type="email" required value={email} onChange={e => setEmail(e.target.value)} autoComplete="username" /></label>
-      <label>Mot de passe<input style={inputStyle} type="password" required value={password} onChange={e => setPassword(e.target.value)} autoComplete="current-password" /></label>
-      {siteKey && <div id="admin-captcha" style={{ minHeight: 80 }} />}
-      <button style={buttonStyle} disabled={loading} type="submit">{loading ? "Connexion…" : "Connexion administrateur"}</button>
-    </form>}
-    {connected && <div style={{ display: "flex", gap: 12, margin: "20px 0" }}>
-      <button style={buttonStyle} disabled={loading} onClick={async () => { const { data } = await createPublicSupabaseClient().auth.getSession(); if (data.session) await loadStats(data.session.access_token); }}>Actualiser</button>
-      <button style={{ ...buttonStyle, background: "#475467" }} onClick={logout}>Déconnexion</button>
-    </div>}
-    {message && <p role="alert" style={{ color: "#b42318" }}>{message}</p>}
-    {stats && <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(190px, 1fr))", gap: 16, marginTop: 20 }}>
-      {[ ["Profils", stats.profiles], ["Générations", stats.generations], ["Essais consommés", stats.trialsUsed], ["Réservations actives", stats.activeReservations] ].map(([label, val]) => <article key={label} style={{ padding: 22, border: "1px solid #ddd", borderRadius: 12, background: "#fff" }}><p>{label}</p><strong style={{ fontSize: 32 }}>{val}</strong></article>)}
-      <article style={{ padding: 22, border: "1px solid #ddd", borderRadius: 12, background: "#fff" }}><p>Gemini TTS</p><strong>Désactivé</strong></article>
-    </div>}
-  </main>;
+          <form onSubmit={login}>
+            <div className="vz-field">
+              <label className="vz-label" htmlFor="admin-email">
+                {t("Adresse e-mail", "البريد الإلكتروني")}
+              </label>
+              <input
+                id="admin-email"
+                type="email"
+                className="vz-input"
+                autoComplete="username"
+                required
+                value={email}
+                onChange={(event) => setEmail(event.target.value)}
+              />
+            </div>
+
+            <div className="vz-field">
+              <label className="vz-label" htmlFor="admin-password">
+                {t("Mot de passe", "كلمة المرور")}
+              </label>
+              <input
+                id="admin-password"
+                type="password"
+                className="vz-input"
+                autoComplete="current-password"
+                required
+                value={password}
+                onChange={(event) => setPassword(event.target.value)}
+              />
+            </div>
+
+            {siteKey ? <div id="admin-captcha" style={{ minHeight: 80, marginBottom: 12 }} /> : null}
+
+            <button type="submit" className="vz-btn vz-btn--primary vz-btn--block" disabled={loading}>
+              {loading ? t("Connexion…", "جارٍ الدخول…") : t("Se connecter", "تسجيل الدخول")}
+            </button>
+          </form>
+
+          {message ? (
+            <p className="vz-alert" role="alert" style={{ marginTop: 16 }}>
+              {message}
+            </p>
+          ) : null}
+
+          {phase === "checking" ? (
+            <p className="vz-help" style={{ marginTop: 12 }}>
+              {t("Vérification de la session…", "جارٍ التحقق من الجلسة…")}
+            </p>
+          ) : null}
+        </div>
+      </div>
+    </div>
+  );
 }
